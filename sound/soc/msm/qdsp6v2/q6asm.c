@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2012-2013, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2012-2015, The Linux Foundation. All rights reserved.
  * Author: Brian Swetland <swetland@google.com>
  *
  * This software is licensed under the terms of the GNU General Public
@@ -337,6 +338,111 @@ static void q6asm_session_free(struct audio_client *ac)
 	session[ac->session] = 0;
 	mutex_unlock(&session_lock);
 	ac->session = 0;
+	ac->perf_mode = LEGACY_PCM_MODE;
+	ac->fptr_cache_ops = NULL;
+	return;
+}
+
+static uint32_t q6asm_get_next_buf(uint32_t curr_buf, uint32_t max_buf_cnt)
+{
+	pr_debug("%s: curr_buf = %d, max_buf_cnt = %d\n",
+		 __func__, curr_buf, max_buf_cnt);
+	curr_buf += 1;
+	return (curr_buf >= max_buf_cnt) ? 0 : curr_buf;
+}
+
+void send_asm_custom_topology(struct audio_client *ac)
+{
+	struct acdb_cal_block		cal_block;
+	struct cmd_set_topologies	asm_top;
+	struct asm_buffer_node		*buf_node = NULL;
+	struct list_head		*ptr, *next;
+	int				result;
+	int				size = 4096;
+
+	if (!set_custom_topology)
+		return;
+
+	get_asm_custom_topology(&cal_block);
+	if (cal_block.cal_size == 0) {
+		pr_debug("%s: no cal to send addr= 0x%pa\n",
+				__func__, &cal_block.cal_paddr);
+		return;
+	}
+
+	common_client.mmap_apr = q6asm_mmap_apr_reg();
+	common_client.apr = common_client.mmap_apr;
+	if (common_client.mmap_apr == NULL) {
+		pr_err("%s: q6asm_mmap_apr_reg failed\n",
+			__func__);
+		result = -EPERM;
+		goto mmap_fail;
+	}
+	/* Only call this once */
+	set_custom_topology = 0;
+
+	/* Use first asm buf to map memory */
+	if (common_client.port[IN].buf == NULL) {
+		pr_err("%s: common buf is NULL\n",
+			__func__);
+		goto err_map;
+	}
+	common_client.port[IN].buf->phys = cal_block.cal_paddr;
+
+	result = q6asm_memory_map_regions(&common_client,
+						IN, size, 1, 1);
+	if (result < 0) {
+		pr_err("%s: mmap did not work! addr = 0x%pa, size = %zd\n",
+			__func__, &cal_block.cal_paddr,
+			cal_block.cal_size);
+		goto err_map;
+	}
+
+	list_for_each_safe(ptr, next,
+			&common_client.port[IN].mem_map_handle) {
+		buf_node = list_entry(ptr, struct asm_buffer_node,
+					list);
+		if (buf_node->buf_addr_lsw == cal_block.cal_paddr) {
+			topology_map_handle =  buf_node->mmap_hdl;
+			break;
+		}
+	}
+
+	q6asm_add_hdr_custom_topology(ac, &asm_top.hdr,
+				      APR_PKT_SIZE(APR_HDR_SIZE,
+					sizeof(asm_top)), TRUE);
+	atomic_set(&ac->cmd_state, 1);
+	asm_top.hdr.opcode = ASM_CMD_ADD_TOPOLOGIES;
+	asm_top.payload_addr_lsw = cal_block.cal_paddr;
+	asm_top.payload_addr_msw = 0;
+	asm_top.mem_map_handle = topology_map_handle;
+	asm_top.payload_size = cal_block.cal_size;
+
+	 pr_debug("%s: Sending ASM_CMD_ADD_TOPOLOGIES payload = 0x%x, size = %d, map handle = 0x%x\n",
+		__func__, asm_top.payload_addr_lsw,
+		asm_top.payload_size, asm_top.mem_map_handle);
+
+	result = apr_send_pkt(ac->apr, (uint32_t *) &asm_top);
+	if (result < 0) {
+		pr_err("%s: Set topologies failed payload = 0x%x\n",
+			__func__, cal_block.cal_paddr);
+		goto err_unmap;
+	}
+
+	result = wait_event_timeout(ac->cmd_wait,
+			(atomic_read(&ac->cmd_state) == 0), 5*HZ);
+	if (!result) {
+		pr_err("%s: Set topologies failed after timedout payload = 0x%x\n",
+			__func__, cal_block.cal_paddr);
+		goto err_unmap;
+	}
+	return;
+err_unmap:
+	q6asm_memory_unmap_regions(ac, IN);
+err_map:
+	q6asm_mmap_apr_dereg();
+	set_custom_topology = 1;
+mmap_fail:
 	return;
 }
 
@@ -1126,7 +1232,8 @@ void *q6asm_is_cpu_buf_avail(int dir, struct audio_client *ac, uint32_t *size,
 		user accesses this function,increase cpu
 		buf(to avoid another api)*/
 		port->buf[idx].used = dir;
-		port->cpu_buf = ((port->cpu_buf + 1) & (port->max_buf_cnt - 1));
+		port->cpu_buf = q6asm_get_next_buf(port->cpu_buf,
+						   port->max_buf_cnt);
 		mutex_unlock(&port->lock);
 		return data;
 	}
@@ -1175,7 +1282,8 @@ void *q6asm_is_cpu_buf_avail_nolock(int dir, struct audio_client *ac,
 	 * buf(to avoid another api)
 	 */
 	port->buf[idx].used = dir;
-	port->cpu_buf = ((port->cpu_buf + 1) & (port->max_buf_cnt - 1));
+	port->cpu_buf = q6asm_get_next_buf(port->cpu_buf,
+					   port->max_buf_cnt);
 	return data;
 }
 
@@ -2872,7 +2980,8 @@ int q6asm_read(struct audio_client *ac)
 		read.buf_size = ab->size;
 		read.seq_id = port->dsp_buf;
 		read.hdr.token = port->dsp_buf;
-		port->dsp_buf = (port->dsp_buf + 1) & (port->max_buf_cnt - 1);
+		port->dsp_buf = q6asm_get_next_buf(port->dsp_buf,
+						   port->max_buf_cnt);
 		mutex_unlock(&port->lock);
 		pr_debug("%s:buf add[0x%x] token[%d] uid[%d]\n", __func__,
 						read.buf_addr_lsw,
@@ -2935,7 +3044,8 @@ int q6asm_read_nolock(struct audio_client *ac)
 			}
 		}
 
-		port->dsp_buf = (port->dsp_buf + 1) & (port->max_buf_cnt - 1);
+		port->dsp_buf = q6asm_get_next_buf(port->dsp_buf,
+						   port->max_buf_cnt);
 		pr_debug("%s:buf add[0x%x] token[%d] uid[%d]\n", __func__,
 					read.buf_addr_lsw,
 					read.hdr.token,
@@ -3112,7 +3222,8 @@ int q6asm_write(struct audio_client *ac, uint32_t len, uint32_t msw_ts,
 			write.flags = (0x00000000 | (flags & 0x800000FF));
 		else
 			write.flags = (0x80000000 | flags);
-		port->dsp_buf = (port->dsp_buf + 1) & (port->max_buf_cnt - 1);
+		port->dsp_buf = q6asm_get_next_buf(port->dsp_buf,
+						   port->max_buf_cnt);
 		buf_node = list_first_entry(&ac->port[IN].mem_map_handle,
 						struct asm_buffer_node,
 						list);
@@ -3183,7 +3294,8 @@ int q6asm_write_nolock(struct audio_client *ac, uint32_t len, uint32_t msw_ts,
 			write.flags = (0x00000000 | (flags & 0x800000FF));
 		else
 			write.flags = (0x80000000 | flags);
-		port->dsp_buf = (port->dsp_buf + 1) & (port->max_buf_cnt - 1);
+		port->dsp_buf = q6asm_get_next_buf(port->dsp_buf,
+						   port->max_buf_cnt);
 
 		pr_debug("%s:ab->phys[0x%x]bufadd[0x%x]token[0x%x] buf_id[0x%x]buf_size[0x%x]mmaphdl[0x%x]"
 							, __func__,
